@@ -153,3 +153,69 @@ class SingleHeadAttnLSTM(nn.Module):
         features = self.dual_attn(o_all_time)  # (batch, 2*hidden_size)
         logits = self.fc(features)  # (batch, num_classes)
         return logits
+    
+class MultiHeadTimeDimensionAttention(nn.Module):
+    """
+    for each head i in [1..n]:
+      K_i = W_{i,k}*o_all + b_{i,k}
+      V_i = W_{i,v}*o_all + b_{i,v}
+      Q_i = W_{i,q}*o_last + b_{i,q}
+
+      then,
+      s_i = softmax(Q_i x K_i^T),  (B, 1, T)
+      context_i = s_i x V_i,       (B, 1, Z_head)
+
+      finally,
+      (8) CV = Concat([context_1, ..., context_n]) => (B, 1, Z)
+
+    - B: batch size
+    - T: number of time steps
+    - Z: total feature dimension (embedding dimension)
+    - n: number of heads
+    - Z_head: Z // n, dimension per head
+    """
+
+    def __init__(self,
+                 d_model: int,    # total feature dimension Z
+                 num_heads: int,  # n
+                 bias: bool = True):
+        super().__init__()
+        assert d_model%num_heads == 0, "d_model must be divisible by num_heads"
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model//num_heads 
+
+        # create separate (W_{i,k}, b_{i,k}), (W_{i,v}, b_{i,v}), (W_{i,q}, b_{i,q})
+        # for each head i, they'll be stored in ModuleLists for clarity.
+        # each W_{i,k} is a linear mapping from R^Z -> R^Z_head (from d_model to d_k). --> same for W_{i,v}, W_{i,q}.
+
+        self.linear_k = nn.ModuleList([nn.Linear(d_model, self.d_k, bias=bias)
+                                       for _ in range(num_heads)])
+        self.linear_v = nn.ModuleList([nn.Linear(d_model, self.d_k, bias=bias)
+                                       for _ in range(num_heads)])
+        self.linear_q = nn.ModuleList([nn.Linear(d_model, self.d_k, bias=bias)
+                                       for _ in range(num_heads)])
+
+    def forward(self, o_all: torch.Tensor, o_last: torch.Tensor) -> torch.Tensor:
+        """
+        o_all:  (B, T, Z) 
+        o_last: (B, 1, Z) 
+        returns: CV: (B, 1, Z)  
+        """
+        B, T, Z = o_all.shape
+        head_contexts = []
+
+        # loop over each head i
+        for i in range(self.num_heads):
+            K_i = self.linear_k[i](o_all) #(B, T, d_k) 
+            V_i = self.linear_v[i](o_all) #(B, T, d_k)
+            Q_i = self.linear_q[i](o_last) #(B, 1, d_k)
+            scores = torch.bmm(Q_i, K_i.transpose(1, 2))  #(B, 1, T)
+            s_i = F.softmax(scores, dim=-1)  #(B, 1, T)
+            context_i = torch.bmm(s_i, V_i)  # (B, 1, d_k)
+            head_contexts.append(context_i)
+
+        # (8) CV = Concat([context_1, ..., context_n]) => shape (B, 1, n * d_k) = (B, 1, Z).
+        CV = torch.cat(head_contexts, dim=2)  # cat along feature dim => (B, 1, num_heads * d_k) = (B, 1, d_model)
+        return CV
