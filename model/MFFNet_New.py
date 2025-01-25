@@ -288,7 +288,6 @@ class Conv1x1(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
-
 class FuseModule(nn.Module):
     """
     A lightweight 'fusion' that combines two feature maps (same resolution) by:
@@ -304,7 +303,6 @@ class FuseModule(nn.Module):
         fused = f_top + f_bottom
         out = self.conv(fused)
         return out
-
 
 class RecurrentPyramidModel(nn.Module):
     """
@@ -415,3 +413,250 @@ class RecurrentPyramidModel(nn.Module):
         # final shape: [B, 6*C, T1]
         
         return final, (td1, td2, td3, bu1, bu2, bu3)
+    
+class FeatureAlignment(nn.Module):
+    """
+    1) Align each of the 6 multi-resolution features in time dimension 
+       by applying a 1D conv and (if needed) interpolate to the max length.
+    2) Return a single 4D tensor [B, 6, T, D], 
+       matching the 'Feature Dimension Alignment' block in Figure 7.
+    """
+    def __init__(self, feature_dim):
+        super(FeatureAlignment, self).__init__()
+        # We'll have 6 separate 1x1 convs (one per feature)
+        self.align_convs = nn.ModuleList([
+            nn.Conv1d(feature_dim, feature_dim, kernel_size=1)
+            for _ in range(6)
+        ])
+
+    def forward(self, features):
+        """
+        features: list/tuple of 6 tensors, each shape [B, T_x, D], 
+                  possibly different T_x lengths
+        Returns:  H of shape [B, 6, T_max, D]
+        """
+        # Step 1: find the longest T among the 6 features
+        max_len = max(f.shape[1] for f in features)
+
+        aligned_list = []
+        for i, f in enumerate(features):
+            # f is [B, T_i, D], we want [B, D, T_i] for Conv1d
+            f_1d = f.transpose(1, 2)  # => [B, D, T_i]
+            # apply the 1x1 conv
+            f_aligned = self.align_convs[i](f_1d)  # still [B, D, T_i]
+
+            # if needed, interpolate to max_len
+            if f_aligned.shape[2] != max_len:
+                # use linear interpolation along the temporal axis
+                f_aligned = F.interpolate(
+                    f_aligned, 
+                    size=max_len, 
+                    mode='linear', 
+                    align_corners=False
+                )
+            # now shape is [B, D, max_len]
+            # next we want to store it as [B, max_len, D]
+            f_aligned = f_aligned.transpose(1, 2)  # => [B, max_len, D]
+            aligned_list.append(f_aligned)
+
+        # Step 2: stack along a new dimension => [B, 6, max_len, D]
+        H = torch.stack(aligned_list, dim=1)
+        return H
+
+# Adaptive Fusion Module
+class MultiFeatureFusion(nn.Module):
+    """
+    1) Compute T-dim mean and D-dim mean over the stacked features => 
+       [B, 6] + [B, 6] => [B, 12].
+    2) Generate an attention vector for the 6 channels via FC->ReLU->Softmax.
+    3) Apply the attention to H, sum across dimension=1 (the '6' dimension).
+    4) Add a residual connection from H (averaged or direct).
+    5) Output final fused feature => shape [B, T, D].
+    """
+    def __init__(self, feature_dim):
+        super(MultiFeatureFusion, self).__init__()
+        # We produce a single attention weight per each of the 6 features
+        # from a 12-dimensional input (concatenated means).
+        self.attention_fc = nn.Linear(12, 6)
+        self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=1)  # normalize across the 6 dimension
+
+    def forward(self, H):
+        """
+        H: [B, 6, T, D], from FeatureAlignment
+        Return fused: [B, T, D]
+        """
+        B, N, T, D = H.shape  # N=6
+
+        # 1) Means along T and D:
+        # mean_T => [B, N, D], i.e. average over T dimension
+        mean_T = H.mean(dim=2)  
+        # mean_D => [B, N, T], i.e. average over D dimension
+        mean_D = H.mean(dim=3)
+
+        # 2) Then average again across the leftover dimension to get [B, N]
+        #    We want a single scalar per each of the N=6 slices, from T or D perspective
+        mean_TD = mean_T.mean(dim=2)  # => [B, N]
+        mean_DT = mean_D.mean(dim=2)  # => [B, N]
+
+        # 3) Concatenate them => [B, 2N] = [B, 12]
+        mean_features = torch.cat([mean_TD, mean_DT], dim=1)  # [B, 12]
+
+        # 4) FC -> ReLU -> Softmax => attention vector of shape [B, 6]
+        att_scores = self.attention_fc(mean_features)  # [B, 6]
+        att_scores = self.relu(att_scores)
+        att_weights = self.softmax(att_scores)  # [B, 6]
+        # expand to broadcast over T,D
+        att_weights = att_weights.view(B, N, 1, 1)  # [B, 6, 1, 1]
+
+        # 5) Weighted sum across N=6 dimension => [B, T, D]
+        weighted = H * att_weights  # [B, 6, T, D]
+        fused = weighted.sum(dim=1)  # [B, T, D]
+
+        # 6) Residual connection
+        #    We can simply average H across the 6 dimension to get a 'baseline'
+        #    shape => [B, T, D]
+        residual = H.mean(dim=1)  # [B, T, D]
+        fused = fused + residual
+
+        return fused
+
+class AdaptiveFusionModule(nn.Module):
+    """
+    Overall AFM from Figure 7:
+      - Feature dimension alignment via 1D conv + optional interpolation
+      - Concat into shape [B, 6, T, D]
+      - Multi-feature fusion with channel-wise attention + residual
+    """
+    def __init__(self, feature_dim):
+        super(AdaptiveFusionModule, self).__init__()
+        self.feature_alignment = FeatureAlignment(feature_dim)
+        self.feature_fusion = MultiFeatureFusion(feature_dim)
+
+    def forward(self, features):
+        """
+        features: a list/tuple of 6 multi-resolution features, 
+                  each shaped [B, T_i, D]
+        Returns:
+          fused_output: shape [B, T_max, D]
+        """
+        # Step 1: Align to [B, 6, T_max, D]
+        H = self.feature_alignment(features)
+
+        # Step 2: Fuse => [B, T_max, D]
+        fused_output = self.feature_fusion(H)
+        return fused_output
+
+class MFFNet(nn.Module):
+    """
+    The full Multi Fine-Grained Fusion Network:
+      1) MSFastformer(Speech)  -> speech_rep
+      2) MSFastformer(Text)    -> text_rep
+      3) GatedFusion           -> fused_rep
+      4) Convert fused_rep into 3 scales (f1, f2, f3) 
+      5) RecurrentPyramidModel -> 6 multi-res outputs + final stacked feature
+      6) AdaptiveFusionModule  -> fused multi-resolution feature
+      7) Final FC              -> classification
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # 1) & 2) MSFastformer blocks for each modality
+        self.msfast_speech = MSFastformer(config)
+        self.msfast_text   = MSFastformer(config)
+
+        # 3) Gated Fusion to combine speech & text
+        self.gated_fusion = GatedFusion(
+            hidden_dim=config.hidden_size,
+            dropout_prob=config.hidden_dropout_prob
+        )
+
+        # 4) Convs to produce 3 scales from the fused representation
+        #    Following the paper's note: 
+        #     - "1D kernel size=1" to get first layer (f1),
+        #     - "two 1D kernels size=3, stride=2" to get f2, f3.
+        self.conv_scale1 = nn.Conv1d(
+            in_channels=config.hidden_size, out_channels=config.hidden_size,
+            kernel_size=1, stride=1, padding=0
+        )
+        self.conv_scale2 = nn.Conv1d(
+            in_channels=config.hidden_size, out_channels=config.hidden_size,
+            kernel_size=3, stride=2, padding=1
+        )
+        self.conv_scale3 = nn.Conv1d(
+            in_channels=config.hidden_size, out_channels=config.hidden_size,
+            kernel_size=3, stride=2, padding=1
+        )
+
+        # 5) Recurrent Pyramid Model for multi-resolution feature fusion
+        self.rpm = RecurrentPyramidModel(in_channels=config.hidden_size)
+
+        # 6) Adaptive Fusion Module to do final channel-attention-based merging
+        self.afm = AdaptiveFusionModule(feature_dim=config.hidden_size)
+
+        # 7) Final classification head
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, speech_x, text_x):
+        """
+        speech_x: [B, T_speech, hidden_size]
+        text_x:   [B, T_text,   hidden_size]
+        Returns: logits => [B, num_labels]
+        """
+        # --- 1) MSFastformer for speech ---
+        speech_rep = self.msfast_speech(speech_x)  # [B, T_speech, hidden_size]
+
+        # --- 2) MSFastformer for text ---
+        text_rep = self.msfast_text(text_x)        # [B, T_text, hidden_size]
+
+        # (Optionally) if T_speech != T_text, you might need to pad or align them
+        # to match. The GatedFusion code requires them to have the same shape.
+
+        # --- 3) Gated Fusion (must have same [B, T, hidden_size] shape) ---
+        fused_rep = self.gated_fusion(text_rep, speech_rep)  
+        # => [B, T, hidden_size]
+
+        # --- 4) Produce 3 scales for RPM input ---
+        #     Convert [B, T, hidden_size] => [B, hidden_size, T] for Conv1d
+        fused_rep_1d = fused_rep.transpose(1, 2)  # => [B, hidden_size, T]
+
+        # f1 (scale x1)
+        f1 = self.conv_scale1(fused_rep_1d)  # [B, hidden_size, T]
+        # f2 (scale x1/2)
+        f2 = self.conv_scale2(f1)           # [B, hidden_size, T//2]
+        # f3 (scale x1/4)
+        f3 = self.conv_scale3(f2)           # [B, hidden_size, T//4]
+
+        # The RPM expects [B, C, T_i], so rename 'hidden_size'->C dimension
+        # => each is shape [B, C, T_i]
+        # f1, f2, f3 are already in [B, C, T_i], so we can pass them directly.
+
+        # --- 5) Recurrent Pyramid Model ---
+        # rpm_out => [B, 6*C, T1], plus the 6 intermediate features
+        rpm_out, (td1, td2, td3, bu1, bu2, bu3) = self.rpm(f1, f2, f3)
+        # Note: each tdX/buX is [B, C, T_X]
+
+        # --- 6) Adaptive Fusion Module ---
+        # The AFM wants 6 separate features each in [B, T, C] shape,
+        # so we transpose them from [B, C, T] => [B, T, C].
+        td1_t = td1.transpose(1, 2)
+        td2_t = td2.transpose(1, 2)
+        td3_t = td3.transpose(1, 2)
+        bu1_t = bu1.transpose(1, 2)
+        bu2_t = bu2.transpose(1, 2)
+        bu3_t = bu3.transpose(1, 2)
+
+        afm_input = [td1_t, td2_t, td3_t, bu1_t, bu2_t, bu3_t]
+        fused_multires = self.afm(afm_input)  # => [B, T_max, C]
+
+        # --- 7) Final classification ---
+        # We might pool over time or just take the last state. 
+        # For simplicity, let's do a mean-pool over the time dimension:
+        # fused_multires => [B, T_max, C]
+        pooled = fused_multires.mean(dim=1)  # => [B, C]
+
+        logits = self.classifier(self.dropout(pooled))  # => [B, num_labels]
+        return logits
+
