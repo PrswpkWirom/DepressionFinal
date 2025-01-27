@@ -3,59 +3,70 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 
-# Implementation of Fastformer (modified from  wuch15/Fastformer repository)
 class FastSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
 
         if config.hidden_size % config.num_attention_heads != 0:
-            raise ValueError(
-                "hidden_size must be divisible by num_attention_heads"
-            )
-        
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
+
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.all_head_size = config.hidden_size
-
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
         self.key   = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
-
-        # W_q^T q_i in eq. (3), W_q^T m_i in eq. (6)
         self.query_att = nn.Linear(self.head_dim, 1, bias=False)
         self.m_att     = nn.Linear(self.head_dim, 1, bias=False)
-
-        # last linear transform after element-wise product of k and V.
         self.out_proj = nn.Linear(self.head_dim, self.head_dim, bias=True)
-
-        # Combine all heads back to hidden_size
         self.merge_heads = nn.Linear(self.all_head_size, self.all_head_size)
         self.softmax = nn.Softmax(dim=-1)
-        self.apply(self._init_weights)
+        self._init_weights()
 
-    def _init_weights(self, module):
-        """Simple initialization scheme."""
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
+    def _init_weights(self):
+        init_range = getattr(self.config, "initializer_range", 0.02)
+
+        nn.init.normal_(self.query.weight, mean=0.0, std=init_range)
+        if self.query.bias is not None:
+            nn.init.zeros_(self.query.bias)
+
+        nn.init.normal_(self.key.weight, mean=0.0, std=init_range)
+        if self.key.bias is not None:
+            nn.init.zeros_(self.key.bias)
+
+        nn.init.normal_(self.value.weight, mean=0.0, std=init_range)
+        if self.value.bias is not None:
+            nn.init.zeros_(self.value.bias)
+
+        nn.init.normal_(self.query_att.weight, mean=0.0, std=init_range)
+        
+        nn.init.normal_(self.m_att.weight, mean=0.0, std=init_range)
+
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=init_range)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+        nn.init.normal_(self.merge_heads.weight, mean=0.0, std=init_range)
+        if self.merge_heads.bias is not None:
+            nn.init.zeros_(self.merge_heads.bias)
+
 
     def split_heads(self, x: torch.Tensor):
         """
-        Split [B, seq_len, hidden_size] -> [B, num_heads, seq_len, head_dim].
+        [B, S, D] -> [B, H, S, d]
         """
         B, S, D = x.size()
         x = x.view(B, S, self.num_heads, self.head_dim)
-        return x.permute(0, 2, 1, 3)  # [B, H, S, d]
+        return x.permute(0, 2, 1, 3)
 
     def merge_heads_fn(self, x: torch.Tensor):
         """
-        Merge [B, num_heads, seq_len, head_dim] -> [B, seq_len, hidden_size].
+        [B, H, S, d] -> [B, S, D]
         """
         B, H, S, d = x.size()
-        x = x.permute(0, 2, 1, 3).contiguous()
-        return x.view(B, S, H * d)
+        x = x.permute(0, 2, 1, 3).contiguous()  # [B, S, H, d]
+        return x.view(B, S, H * d)  # [B, S, D]
 
     def forward(self, query_states, key_states, value_states, attention_mask=None):
         B, Sq, _ = query_states.shape
@@ -72,7 +83,10 @@ class FastSelfAttention(nn.Module):
             aggregator_logits_q = aggregator_logits_q + attention_mask.view(B, 1, -1)
 
         att_weights_q = self.softmax(aggregator_logits_q)   # [B, H, Sq]
-        q_global = torch.einsum('bhsi,bhs->bhd', Q, att_weights_q)  # [B, H, d]
+        # print("Q shape:", Q.shape)
+        # print("att_weights_q shape:", att_weights_q.shape)
+
+        q_global = torch.einsum('bhsd,bhs->bhd', Q, att_weights_q)  # [B, H, d]
 
         # M = q_global * K (element-wise for each position i)
         # M_i = q_global \odot K_i
@@ -84,16 +98,14 @@ class FastSelfAttention(nn.Module):
         aggregator_logits_m = aggregator_logits_m.squeeze(-1)           # [B, H, Sk]
 
         if attention_mask is not None:
-            pass
+            aggregator_logits_m = aggregator_logits_m + attention_mask.view(B, 1, -1)
+
 
         att_weights_m = self.softmax(aggregator_logits_m)  # [B, H, Sk]
 
         # 5) k_global = sum_i a_i * m_i  => [B, H, d]
-        k_global = torch.einsum('bhsi,bhs->bhd', M, att_weights_m)
-
-        # 6) For each position i in V, do elementwise multiply with k_global
-        #    => e_i = out_proj( k_global \odot v_i )
-        # so E has shape [B, H, Sk, d]. Then we'll combine E with the "original Q" somehow
+        k_global = torch.einsum('bhsd,bhs->bhd', M, att_weights_m)
+ 
         kg = k_global.unsqueeze(2)                  # [B, H, 1, d]
         KV_interaction = kg * V                     # [B, H, Sk, d]
         E = self.out_proj(KV_interaction)           # [B, H, Sk, d]
@@ -102,7 +114,8 @@ class FastSelfAttention(nn.Module):
             raise ValueError("Fastformer aggregator: mismatch in seq_len (Sq vs Sk).")
 
         out_heads = E + Q  # shape [B, H, Sq, d]
-        out = self.merge_heads(out_heads)  # [B, Sq, all_head_size]
+        out = self.merge_heads_fn(out_heads)  # [B, Sq, all_head_size]
+        #print("out after aggregator:", out.shape)
 
         return out
 
@@ -159,15 +172,30 @@ class MSFastformer(nn.Module):
         super().__init__()
         self.config = config
 
+        # Single definitions of LayerNorm
         self.layernorm_in = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layernorm_out = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        # Convolutions
         self.conv1 = nn.Conv1d(config.hidden_size, config.hidden_size, kernel_size=1, padding=0)
         self.conv3 = nn.Conv1d(config.hidden_size, config.hidden_size, kernel_size=3, padding=1)
         self.conv5 = nn.Conv1d(config.hidden_size, config.hidden_size, kernel_size=5, padding=2)
+
+        # Fastformer layers
         self.fastformer_1 = FastformerLayer(config)
         self.fastformer_3 = FastformerLayer(config)
         self.fastformer_5 = FastformerLayer(config)
+    #     print("fastformer_1 out_proj weight:", 
+    # self.fastformer_1.attention.self.out_proj.weight.shape)
 
-        self.layernorm_out = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+    #     print("fastformer_3 out_proj weight:", 
+    # self.fastformer_3.attention.self.out_proj.weight.shape)
+
+    #     print("fastformer_5 out_proj weight:", 
+    # self.fastformer_5.attention.self.out_proj.weight.shape)
+
+
+        # Feed-forward
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
@@ -201,9 +229,12 @@ class MSFastformer(nn.Module):
         U5 = self.conv5(x_t).transpose(1, 2)          # [B, S, D]
 
         P1 = self.fastformer_1(U5, U3, U3, attention_mask)
+        #print("P1 shape:", P1.shape)
         P2 = self.fastformer_3(U3, U1, U1, attention_mask)
         P3 = self.fastformer_5(U1, U5, U5, attention_mask)
         P  = P1 + P2 + P3  # [B, S, D]
+        #print("P shape after sum:", P.shape)
+        
 
         P_norm = self.layernorm_out(P)
         I = self.fc2(self.gelu(self.fc1(P_norm)))
@@ -314,10 +345,7 @@ class RecurrentPyramidModel(nn.Module):
     """
     def __init__(self, in_channels):
         super().__init__()
-        # in_channels is the channel dimension for f1, f2, f3
-        # We assume all 3 features have the same # of channels 
-        # (the difference is in their time resolution).
-        
+
         # For top-down and bottom-up, we'll define small modules:
         self.fuse12 = FuseModule(in_channels)  # fuse f1<->f2 or td1<->td2
         self.fuse23 = FuseModule(in_channels)  # fuse f2<->f3 or td2<->td3
@@ -335,9 +363,6 @@ class RecurrentPyramidModel(nn.Module):
             kernel_size=3, stride=2, padding=1, bias=True
         )
         
-        # For upsampling, we can use interpolation
-        # (or a conv-transpose if you prefer).
-        # We do nearest neighbor here.
         self.upsample = lambda x, scale=2: F.interpolate(
             x, scale_factor=scale, mode='nearest'
         )
@@ -350,70 +375,38 @@ class RecurrentPyramidModel(nn.Module):
         
         Where T2 ~ T1/2, T3 ~ T1/4.
         """
-        # ============= STEP 1: Top-Down Pass =============
-        # We'll keep the original names:
-        #   td3 = f3
-        #   td2 = fuse( f2, upsample(f3) )
-        #   td1 = fuse( f1, upsample(td2) )
-        
+
         td3 = f3
         # Upsample f3 -> same size as f2
-        up3 = self.upsample(td3, scale=2)  # T3->T2
+        up3 = F.interpolate(td3, size=f2.shape[-1], mode='nearest')
         td2 = self.fuse_td2(up3, f2)
         
         # Upsample td2 -> same size as f1
-        up2 = self.upsample(td2, scale=2)  # T2->T1
+        up2 = F.interpolate(td2, size=f1.shape[-1], mode='nearest')
         td1 = self.fuse_td1(up2, f1)
-        
-        # ============= STEP 2: Bottom-Up Pass =============
-        # The paper says: "the bottom fused features are combined with the top features
-        # through downsampling, and again top-down fusion is performed..."
-        #
-        # A straightforward way: 
-        #   bu1 = td1
-        #   bu2 = fuse( td2, downsample(td1) )
-        #   bu3 = fuse( td3, downsample(bu2) )
-        
         bu1 = td1
         
         # Downsample td1 -> size of td2
-        down1 = self.downsample(bu1)  # T1->T2
+        down1 = F.interpolate(bu1, size=td2.shape[-1], mode='nearest')  # T1->T2
         bu2 = self.fuse_bu2(td2, down1)
         
         # Downsample bu2 -> size of td3
-        down2 = self.downsample(bu2)  # T2->T3
+        down2 = F.interpolate(bu2, size=td3.shape[-1], mode='nearest')
         bu3 = self.fuse_bu3(td3, down2)
         
-        # ============= STEP 3: Concatenate results =============
-        #
-        # "Finally, the outputs of these two fusion paths are concatenated to obtain
-        #  the final feature representation of the RPM."
-        #
-        # We have two "paths":
-        #   - top-down path: td1, td2, td3
-        #   - bottom-up path: bu1, bu2, bu3
-        #
-        # We'll just concat them channel-wise. 
-        # Often you'll then feed them into another 1x1 conv or your next network block.
-        
-        # Each of these has a different temporal length (td1 is T1, td2 is T2, td3 is T3),
-        # so typically you'd either keep them separate or upsample/downsample to unify dimension
-        # before final concatenation.
-        #
-        # If you want one big tensor, you must unify or flatten them. 
-        # For the sake of demonstration, let's unify them to T1 by upsampling the smaller ones:
-        
-        td2_up = self.upsample(td2, scale=2)  # T2->T1
-        td3_up = self.upsample(td3, scale=4)  # T3->T1
-        bu2_up = self.upsample(bu2, scale=2)
-        bu3_up = self.upsample(bu3, scale=4)
-        
-        # Now all are [B, C, T1]. We can safely concat along channel dimension:
+        td3_up = F.interpolate(td3, size=f1.shape[-1], mode='nearest')
+        td2_up = F.interpolate(td2, size=f1.shape[-1], mode='nearest')
+        bu2_up = F.interpolate(bu2, size=f1.shape[-1], mode='nearest')
+        bu3_up = F.interpolate(bu3, size=f1.shape[-1], mode='nearest')
+
+        final = torch.cat([td1, td2_up, td3_up, bu1, bu2_up, bu3_up], dim=1)
+
         final = torch.cat([td1, td2_up, td3_up, bu1, bu2_up, bu3_up], dim=1)
         # final shape: [B, 6*C, T1]
         
         return final, (td1, td2, td3, bu1, bu2, bu3)
-    
+
+# Adaptive Fusion Module
 class FeatureAlignment(nn.Module):
     """
     1) Align each of the 6 multi-resolution features in time dimension 
@@ -423,7 +416,6 @@ class FeatureAlignment(nn.Module):
     """
     def __init__(self, feature_dim):
         super(FeatureAlignment, self).__init__()
-        # We'll have 6 separate 1x1 convs (one per feature)
         self.align_convs = nn.ModuleList([
             nn.Conv1d(feature_dim, feature_dim, kernel_size=1)
             for _ in range(6)
@@ -435,12 +427,10 @@ class FeatureAlignment(nn.Module):
                   possibly different T_x lengths
         Returns:  H of shape [B, 6, T_max, D]
         """
-        # Step 1: find the longest T among the 6 features
         max_len = max(f.shape[1] for f in features)
 
         aligned_list = []
         for i, f in enumerate(features):
-            # f is [B, T_i, D], we want [B, D, T_i] for Conv1d
             f_1d = f.transpose(1, 2)  # => [B, D, T_i]
             # apply the 1x1 conv
             f_aligned = self.align_convs[i](f_1d)  # still [B, D, T_i]
@@ -462,8 +452,7 @@ class FeatureAlignment(nn.Module):
         # Step 2: stack along a new dimension => [B, 6, max_len, D]
         H = torch.stack(aligned_list, dim=1)
         return H
-
-# Adaptive Fusion Module
+    
 class MultiFeatureFusion(nn.Module):
     """
     1) Compute T-dim mean and D-dim mean over the stacked features => 
@@ -549,114 +538,57 @@ class AdaptiveFusionModule(nn.Module):
 
 class MFFNet(nn.Module):
     """
-    The full Multi Fine-Grained Fusion Network:
-      1) MSFastformer(Speech)  -> speech_rep
-      2) MSFastformer(Text)    -> text_rep
-      3) GatedFusion           -> fused_rep
-      4) Convert fused_rep into 3 scales (f1, f2, f3) 
-      5) RecurrentPyramidModel -> 6 multi-res outputs + final stacked feature
-      6) AdaptiveFusionModule  -> fused multi-resolution feature
-      7) Final FC              -> classification
+    The overall MFFNet architecture:
+      1) Two MSFastformer encoders (one for text, one for speech)
+      2) Gated Fusion of text + speech -> fused rep
+      3) Recurrent Pyramid Model on that fused rep, generating multi-res outputs
+      4) Adaptive Fusion Module (AFM) on those 6 multi-res outputs
+      5) Final FC to produce binary depression classification
     """
-    def __init__(self, config):
+    def __init__(self, config, num_classes=2):
         super().__init__()
         self.config = config
+        self.num_classes = num_classes
 
-        # 1) & 2) MSFastformer blocks for each modality
-        self.msfast_speech = MSFastformer(config)
-        self.msfast_text   = MSFastformer(config)
+        self.text_encoder = MSFastformer(config)
+        self.speech_encoder = MSFastformer(config)
+        self.gated_fusion = GatedFusion(hidden_dim=config.hidden_size,
+                                        dropout_prob=config.hidden_dropout_prob)
 
-        # 3) Gated Fusion to combine speech & text
-        self.gated_fusion = GatedFusion(
-            hidden_dim=config.hidden_size,
-            dropout_prob=config.hidden_dropout_prob
-        )
-
-        # 4) Convs to produce 3 scales from the fused representation
-        #    Following the paper's note: 
-        #     - "1D kernel size=1" to get first layer (f1),
-        #     - "two 1D kernels size=3, stride=2" to get f2, f3.
-        self.conv_scale1 = nn.Conv1d(
-            in_channels=config.hidden_size, out_channels=config.hidden_size,
-            kernel_size=1, stride=1, padding=0
-        )
-        self.conv_scale2 = nn.Conv1d(
-            in_channels=config.hidden_size, out_channels=config.hidden_size,
-            kernel_size=3, stride=2, padding=1
-        )
-        self.conv_scale3 = nn.Conv1d(
-            in_channels=config.hidden_size, out_channels=config.hidden_size,
-            kernel_size=3, stride=2, padding=1
-        )
-
-        # 5) Recurrent Pyramid Model for multi-resolution feature fusion
         self.rpm = RecurrentPyramidModel(in_channels=config.hidden_size)
-
-        # 6) Adaptive Fusion Module to do final channel-attention-based merging
         self.afm = AdaptiveFusionModule(feature_dim=config.hidden_size)
 
-        # 7) Final classification head
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, self.num_classes)
 
-    def forward(self, speech_x, text_x):
+    def forward(self, text_in, speech_in, attention_mask_text=None, attention_mask_speech=None):
         """
-        speech_x: [B, T_speech, hidden_size]
-        text_x:   [B, T_text,   hidden_size]
-        Returns: logits => [B, num_labels]
+        text_in, speech_in: [B, T, D] embeddings for text and speech
+        attention_mask_*: optional [B, T] for each
+        Returns: logits => [B, num_classes]
         """
-        # --- 1) MSFastformer for speech ---
-        speech_rep = self.msfast_speech(speech_x)  # [B, T_speech, hidden_size]
+        text_rep = self.text_encoder(text_in, attention_mask_text)      # [B, T, D]
+        speech_rep = self.speech_encoder(speech_in, attention_mask_speech)  # [B, T, D]
 
-        # --- 2) MSFastformer for text ---
-        text_rep = self.msfast_text(text_x)        # [B, T_text, hidden_size]
+        fused_rep = self.gated_fusion(text_rep, speech_rep)
 
-        # (Optionally) if T_speech != T_text, you might need to pad or align them
-        # to match. The GatedFusion code requires them to have the same shape.
+        fused_rep_t = fused_rep.transpose(1, 2)  # => [B, D, T], the 'C' dimension is D
 
-        # --- 3) Gated Fusion (must have same [B, T, hidden_size] shape) ---
-        fused_rep = self.gated_fusion(text_rep, speech_rep)  
-        # => [B, T, hidden_size]
+        f1 = fused_rep_t  # full scale => shape [B, D, T]
+        f2 = F.avg_pool1d(f1, kernel_size=2, stride=2)  # => [B, D, T//2]
+        f3 = F.avg_pool1d(f2, kernel_size=2, stride=2)  # => [B, D, T//4]
 
-        # --- 4) Produce 3 scales for RPM input ---
-        #     Convert [B, T, hidden_size] => [B, hidden_size, T] for Conv1d
-        fused_rep_1d = fused_rep.transpose(1, 2)  # => [B, hidden_size, T]
-
-        # f1 (scale x1)
-        f1 = self.conv_scale1(fused_rep_1d)  # [B, hidden_size, T]
-        # f2 (scale x1/2)
-        f2 = self.conv_scale2(f1)           # [B, hidden_size, T//2]
-        # f3 (scale x1/4)
-        f3 = self.conv_scale3(f2)           # [B, hidden_size, T//4]
-
-        # The RPM expects [B, C, T_i], so rename 'hidden_size'->C dimension
-        # => each is shape [B, C, T_i]
-        # f1, f2, f3 are already in [B, C, T_i], so we can pass them directly.
-
-        # --- 5) Recurrent Pyramid Model ---
-        # rpm_out => [B, 6*C, T1], plus the 6 intermediate features
         rpm_out, (td1, td2, td3, bu1, bu2, bu3) = self.rpm(f1, f2, f3)
-        # Note: each tdX/buX is [B, C, T_X]
 
-        # --- 6) Adaptive Fusion Module ---
-        # The AFM wants 6 separate features each in [B, T, C] shape,
-        # so we transpose them from [B, C, T] => [B, T, C].
-        td1_t = td1.transpose(1, 2)
-        td2_t = td2.transpose(1, 2)
-        td3_t = td3.transpose(1, 2)
-        bu1_t = bu1.transpose(1, 2)
-        bu2_t = bu2.transpose(1, 2)
-        bu3_t = bu3.transpose(1, 2)
+        td1_ = td1.transpose(1, 2)  # => [B, T1, D]
+        td2_ = td2.transpose(1, 2)  # => [B, T2, D]
+        td3_ = td3.transpose(1, 2)  # => [B, T3, D]
+        bu1_ = bu1.transpose(1, 2)
+        bu2_ = bu2.transpose(1, 2)
+        bu3_ = bu3.transpose(1, 2)
 
-        afm_input = [td1_t, td2_t, td3_t, bu1_t, bu2_t, bu3_t]
-        fused_multires = self.afm(afm_input)  # => [B, T_max, C]
+        fused_afm = self.afm([td1_, td2_, td3_, bu1_, bu2_, bu3_])  # => [B, T_max, D]
 
-        # --- 7) Final classification ---
-        # We might pool over time or just take the last state. 
-        # For simplicity, let's do a mean-pool over the time dimension:
-        # fused_multires => [B, T_max, C]
-        pooled = fused_multires.mean(dim=1)  # => [B, C]
+        pooled = fused_afm.mean(dim=1)  # [B, D]
 
-        logits = self.classifier(self.dropout(pooled))  # => [B, num_labels]
+        logits = self.classifier(pooled)  # => [B, num_classes]
         return logits
-
