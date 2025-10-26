@@ -12,7 +12,8 @@ from torch.cuda import amp
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
-from dataloader.tsaug_tradMFFNet import make_loader, collate_mffnet, RepeatAugmentDataset
+from dataloader.tradMFFNet import make_loader, collate_mffnet
+#from dataloader.tsaug_tradMFFNet import make_loader, collate_mffnet, RepeatAugmentDataset
 from model.tradMFFNet import MFFNetCore  # your model file
 
 # ---------------------------
@@ -206,8 +207,8 @@ def main(cfg: TrainConfig):
 
     # ---- data ----
     labels_dir = cfg.labels_dir or os.path.join(cfg.dataset_dir, "label")
-    # train_ds, train_dl = make_loader(cfg.dataset_dir, "train", labels_dir=labels_dir,
-    #                                  batch_size=cfg.batch_size, shuffle=True, augment_train=True)
+    train_ds, train_dl = make_loader(cfg.dataset_dir, "train", labels_dir=labels_dir,
+                                     batch_size=cfg.batch_size, shuffle=True, augment_train=False)
     base_train_ds, _ = make_loader(
         cfg.dataset_dir, "train",
         labels_dir=labels_dir,
@@ -215,20 +216,20 @@ def main(cfg: TrainConfig):
         augment_train=True,      # ensure base has an augmenter
     )
 
-    # Expand: keep original + 2 augmented views -> 3× dataset
-    train_ds = RepeatAugmentDataset(base_train_ds, k=2, keep_original=True)
+    # # Expand: keep original + 2 augmented views -> 3× dataset
+    # train_ds = RepeatAugmentDataset(base_train_ds, k=2, keep_original=True)
 
-    # Now make a loader from the expanded dataset
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        collate_fn=collate_mffnet,
-        drop_last=False,
-        worker_init_fn=lambda _: (np.random.seed(torch.initial_seed() % 2**32), random.seed(torch.initial_seed() % 2**32)),
-    )
+    # # Now make a loader from the expanded dataset
+    # train_dl = DataLoader(
+    #     train_ds,
+    #     batch_size=cfg.batch_size,
+    #     shuffle=True,
+    #     num_workers=4,
+    #     pin_memory=True,
+    #     collate_fn=collate_mffnet,
+    #     drop_last=False,
+    #     worker_init_fn=lambda _: (np.random.seed(torch.initial_seed() % 2**32), random.seed(torch.initial_seed() % 2**32)),
+    # )
 
     val_ds,   val_dl   = make_loader(cfg.dataset_dir, "validate", labels_dir=labels_dir,
                                      batch_size=cfg.batch_size, shuffle=False, augment_train=False)
