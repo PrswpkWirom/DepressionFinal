@@ -1,0 +1,16 @@
+[train] train.csv
+  IDs in CSV: 107
+  Moved:      107
+  Already in train/: 0
+
+[validate] validate.csv
+  IDs in CSV: 35
+  Moved:      35
+  Already in validate/: 0
+
+[test] test.csv
+  IDs in CSV: 47
+  Moved:      47
+  Already in test/: 0
+
+No leftover .pt files in BASE_DIR.
